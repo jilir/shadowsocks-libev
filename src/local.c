@@ -34,6 +34,9 @@
 #include <unistd.h>
 #include <getopt.h>
 
+//my
+ #include "xt_geoip.h"
+
 #ifndef __MINGW32__
 #include <errno.h>
 #include <arpa/inet.h>
@@ -79,6 +82,10 @@
 #define BUF_SIZE 2048
 #endif
 
+//my
+struct xt_geoip_match_info *ginfo;
+
+
 int acl = 0;
 int verbose = 0;
 int udprelay = 0;
@@ -88,6 +95,15 @@ static int fast_open = 0;
 static int nofile = 0;
 #endif
 #endif
+
+void *geoip_get_subnets(const char *code, uint32_t *count, uint8_t nfproto);
+struct geoip_country_user *geoip_load_cc(const char *code, unsigned short cc, uint8_t nfproto);
+u_int16_t check_geoip_cc(char *cc, u_int16_t cc_used[], u_int8_t count);
+unsigned int parse_geoip_cc(const char *ccstr, uint16_t *cc, union geoip_country_group *mem, uint8_t nfproto);
+int geoip_parse(bool invert, unsigned int *flags, const char *arg);
+bool geoip_bsearch4(const struct geoip_subnet4 *range, uint32_t addr, int lo, int hi);
+bool xt_geoip_mt4(const char *host, const struct xt_geoip_match_info *info);
+
 
 static void server_recv_cb(EV_P_ ev_io *w, int revents);
 static void server_send_cb(EV_P_ ev_io *w, int revents);
@@ -428,7 +444,9 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
                     LOGI("connect to %s:%s", host, port);
                 }
 
-                if ((acl && request->atyp == 1 && acl_contains_ip(host))) {
+                //if ((acl && request->atyp == 1 && acl_contains_ip(host))) {
+                //xt_geoip_mt4
+                if ((acl && request->atyp == 1 && xt_geoip_mt4(host, ginfo))) {
                     if (verbose) {
                         LOGI("bypass %s:%s", host, port);
                     }
@@ -889,6 +907,8 @@ int main(int argc, char **argv)
     char *remote_port = NULL;
 
     int option_index = 0;
+
+    int geo_flag = 0;
     static struct option long_options[] =
     {
         { "fast-open", no_argument,       0, 0 },
@@ -905,8 +925,10 @@ int main(int argc, char **argv)
             if (option_index == 0) {
                 fast_open = 1;
             } else if (option_index == 1) {
-                LOGI("initialize acl...");
-                acl = !init_acl(optarg);
+                LOGI("initialize geo...");
+                //acl = !init_acl(optarg);
+                geoip_parse(0, &geo_flag, optarg);
+                acl = 1;
             }
             break;
         case 's':
@@ -1256,3 +1278,212 @@ int start_ss_local_server(profile_t profile)
 
 #endif
 
+bool
+xt_geoip_mt4(const char *host, const struct xt_geoip_match_info *info)
+{
+    struct in_addr addr; 
+    const struct geoip_country_user *node;
+    unsigned int i;
+    uint32_t ip;
+    inet_aton(host, &addr);
+    ip = ntohl(addr.s_addr);//inet_network(host);//ntohl((info->flags & XT_GEOIP_SRC) ? iph->saddr : iph->daddr);
+    
+    for (i = 0; i < info->count; i++) {
+        //fprintf(stderr, "%d :Checking...%s %x\n", i, host, ip);
+        if ((node = info->mem[i].user) == NULL) {
+            printf("xt_geoip: what the hell ??  isn't loaded into memory... skip it!\n");
+            continue;
+        }
+        if (geoip_bsearch4(node->subnets, ip, 0, node->count)) {
+            return !(info->flags & XT_GEOIP_INV);
+        }
+    }
+
+    return info->flags & XT_GEOIP_INV;
+}
+bool geoip_bsearch4(const struct geoip_subnet4 *range,
+    uint32_t addr, int lo, int hi)
+{
+    int mid;
+
+    while (true) {
+        if (hi <= lo)
+            return false;
+        mid = (lo + hi) / 2;
+        if (range[mid].begin <= addr && addr <= range[mid].end)
+            return true;
+        if (range[mid].begin > addr)
+            hi = mid;
+        else if (range[mid].end < addr)
+            lo = mid + 1;
+        else
+            break;
+    }
+
+    //WARN_ON(true);
+    return false;
+}
+
+
+
+int geoip_parse(bool invert, unsigned int *flags,
+    const char *arg)//NFPROTO_IPV4
+{
+    ginfo = (struct xt_geoip_match_info *)malloc(sizeof(struct xt_geoip_match_info));
+    if (*flags & (XT_GEOIP_SRC | XT_GEOIP_DST))
+        printf(
+            "geoip: Only exactly one of --source-country "
+            "or --destination-country must be specified!");
+    *flags |= XT_GEOIP_DST;
+    if (invert)
+        *flags |= XT_GEOIP_INV;
+    ginfo->count = parse_geoip_cc(arg, ginfo->cc, ginfo->mem,
+                  NFPROTO_IPV4);
+    ginfo->flags = *flags;
+    return true;
+
+}
+
+unsigned int parse_geoip_cc(const char *ccstr, uint16_t *cc,
+    union geoip_country_group *mem, uint8_t nfproto)
+{
+    char *buffer, *cp, *next;
+    u_int8_t i, count = 0;
+    u_int16_t cctmp;
+
+    buffer = strdup(ccstr);
+    if (!buffer)
+        printf(
+            "geoip: insufficient memory available");
+
+    for (cp = buffer, i = 0; cp && i < XT_GEOIP_MAX; cp = next, i++)
+    {
+        next = strchr(cp, ',');
+        if (next) *next++ = '\0';
+        fprintf(stderr,             "geoip:cp:%s", cp);
+        if ((cctmp = check_geoip_cc(cp, cc, count)) != 0) {
+            fprintf(stderr,
+                    "geoip: load,iv4");
+            if ((mem[count++].user =
+                (unsigned long)geoip_load_cc(cp, cctmp, nfproto)) == 0)
+                fprintf(stderr,
+                    "geoip: insufficient memory available");
+            cc[count-1] = cctmp;
+        }
+    }
+
+    if (cp)
+        printf(
+            "geoip: too many countries specified");
+    free(buffer);
+
+    if (count == 0)
+        fprintf(stderr,
+            "geoip: don't know what happened");
+
+    return count;
+}
+
+u_int16_t
+check_geoip_cc(char *cc, u_int16_t cc_used[], u_int8_t count)
+{
+    u_int8_t i;
+    u_int16_t cc_int16;
+
+    if (strlen(cc) != 2) /* Country must be 2 chars long according
+                                                     to the ISO3166 standard */
+        printf(
+            "geoip: invalid country code '%s'", cc);
+
+    // Verification will fail if chars aren't uppercased.
+    // Make sure they are..
+    for (i = 0; i < 2; i++)
+        if (isalnum(cc[i]) != 0)
+            cc[i] = toupper(cc[i]);
+        else
+            printf(
+                "geoip:  invalid country code '%s'", cc);
+
+    /* Convert chars into a single 16 bit integer.
+     * FIXME:   This assumes that a country code is
+     *           exactly 2 chars long. If this is
+     *           going to change someday, this whole
+     *           match will need to be rewritten, anyway.
+     *                                           - SJ  */
+    cc_int16 = (cc[0] << 8) | cc[1];
+
+    // Check for presence of value in cc_used
+    for (i = 0; i < count; i++)
+        if (cc_int16 == cc_used[i])
+            return 0; // Present, skip it!
+
+    return cc_int16;
+}
+
+struct geoip_country_user *geoip_load_cc(const char *code,
+    unsigned short cc, uint8_t nfproto)
+{
+    struct geoip_country_user *g_info;
+    g_info = malloc(sizeof(struct geoip_country_user));
+
+    if (!g_info)
+        return NULL;
+
+    g_info->subnets = (unsigned long)geoip_get_subnets(code,
+                     &g_info->count, nfproto);
+    g_info->cc = cc;
+
+    return g_info;
+}
+
+void *
+geoip_get_subnets(const char *code, uint32_t *count, uint8_t nfproto)
+{
+    void *subnets;
+    struct stat sb;
+    char buf[256];
+    int fd;
+
+    /* Use simple integer vector files */
+    if (nfproto == NFPROTO_IPV6) {
+#if __BYTE_ORDER == _BIG_ENDIAN
+        snprintf(buf, sizeof(buf), GEOIP_DB_DIR "/BE/%s.iv6", code);
+#else
+        snprintf(buf, sizeof(buf), GEOIP_DB_DIR "/LE/%s.iv6", code);
+#endif
+    } else {
+#if __BYTE_ORDER == _BIG_ENDIAN
+        snprintf(buf, sizeof(buf), GEOIP_DB_DIR "/BE/%s.iv4", code);
+#else
+        snprintf(buf, sizeof(buf), GEOIP_DB_DIR "/LE/%s.iv4", code);
+#endif
+    }
+
+    if ((fd = open(buf, O_RDONLY)) < 0) {
+        fprintf(stderr, "Could not open %s: %s\n", buf, strerror(errno));
+        printf("Could not read geoip database");
+    }
+
+    fstat(fd, &sb);
+    *count = sb.st_size;
+    switch (nfproto) {
+    case NFPROTO_IPV6:
+        if (sb.st_size % sizeof(struct geoip_subnet6) != 0)
+            printf(
+                "Database file %s seems to be corrupted", buf);
+        *count /= sizeof(struct geoip_subnet6);
+        break;
+    case NFPROTO_IPV4:
+        if (sb.st_size % sizeof(struct geoip_subnet4) != 0)
+            printf(
+                "Database file %s seems to be corrupted", buf);
+        *count /= sizeof(struct geoip_subnet4);
+        break;
+    }
+    subnets = malloc(sb.st_size);
+    if (subnets == NULL)
+        printf( "geoip: insufficient memory");
+    read(fd, subnets, sb.st_size);
+    close(fd);
+    return subnets;
+}
