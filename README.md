@@ -1,4 +1,4 @@
-shadowsocks-libev
+shadowsocks-libev with geoip
 =================
 
 Intro
